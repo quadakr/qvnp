@@ -8,9 +8,11 @@ import signal
 import subprocess
 import sys
 import time
+import math
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter, ImageChops
+
 except ImportError:
     sys.stderr.write("qvnp: PIL is not installed. 'pip install --break-system-packages pillow' or search for it in your system repositories\n")
     sys.exit(1)
@@ -18,13 +20,32 @@ except ImportError:
 # ---- hardcoded control points ------------------------------------------
 DEFAULT_FPS = 15.0
 MAX_CATCHUP_DROP = 15
-AUDIO_START_GRACE = 0.05
+AUDIO_START_GRACE = 0.01
 FFMPEG_SCALE_FLAGS = "flags=lanczos"
 FFMPEG_SCALE_FLAGS_PIXELIZE = "flags=neighbor"  # --pixelize: point-sampling
-HIGHLIGHT_AMOUNT_STEP = 0.5
 PIXEL_BLEND_MIN = 1
 PIXEL_BLEND_MAX = 8
-DEFAULT_PIXEL_BLEND = 8  # 8 = pure point-sample (sharpest), 1 = fully averaged
+DEFAULT_PIXEL_BLEND = 8
+
+HIGHLIGHT_RADIUS_BASE = 8
+HIGHLIGHT_RADIUS_STEP = 4
+HIGHLIGHT_DIFF_MIN = 180
+
+HIGHLIGHT_CROSSHAIR_EPS = 0.08
+
+# --------------------------------------------------------------------------
+
+# Per-effect defaults when the effect flag is NOT given explicitly.
+EFFECT_NORMAL_DEFAULTS = {
+    "gamma": 1.0, "brightness": 0.0, "contrast": 1.0, "saturation": 1.0,
+    "highlight": 0, "red": 1.0, "green": 1.0, "blue": 1.0,
+}
+# Preset applied by -e/--enhance to whichever of the above the user did NOT
+# explicitly set themselves. Tune here.
+EFFECT_ENHANCE_DEFAULTS = {
+    "gamma": 1.0, "brightness": 0.0, "contrast": 1.0, "saturation": 1.0,
+    "highlight": 4, "red": 1.0, "green": 1.0, "blue": 1.0,
+}
 # ------------------------------------------------------------------------
 
 RESET = "\033[0m"
@@ -53,6 +74,12 @@ def check_binaries():
         if shutil.which(b) is None:
             sys.stderr.write(f"qvnp: not found {b} in PATH\n")
             sys.exit(1)
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+
+
+def is_static_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
 
 
 def ffprobe_json(path: str, extra_args) -> dict:
@@ -169,20 +196,108 @@ def render_full(img: Image.Image, row_mult: int, pixelize: bool = False, blend_f
     return "\n".join(out)
 
 
-def build_vf(fps: float, w: int, h: int, highlight: int, pixelize: bool) -> str:
-    parts = [f"fps={fps}"]
-    if highlight:
-        amt = round(highlight * HIGHLIGHT_AMOUNT_STEP, 2)
-        parts.append(f"unsharp=5:5:{amt}:5:5:{amt}")
-    scale_flags = FFMPEG_SCALE_FLAGS_PIXELIZE if pixelize else FFMPEG_SCALE_FLAGS
-    parts.append(f"scale={w}:{h}:{scale_flags}")
-    return ",".join(parts)
+
+def build_filter_complex(fps: float, src_w: int, src_h: int, target_w: int, target_h: int,
+                          highlight: int, pixelize: bool,
+                          gamma: float, brightness: float, contrast: float, saturation: float,
+                          red: float, green: float, blue: float):
+    stages = []
+    cur = "s0"
+    stages.append(f"[0:v]fps={fps}[{cur}]")
+
+    eq_parts = []
+    if gamma != 1.0:
+        eq_parts.append(f"gamma={gamma}")
+    if brightness != 0.0:
+        eq_parts.append(f"brightness={brightness}")
+    if contrast != 1.0:
+        eq_parts.append(f"contrast={contrast}")
+    if saturation != 1.0:
+        eq_parts.append(f"saturation={saturation}")
+    if eq_parts:
+        nxt = "s2"
+        stages.append(f"[{cur}]eq=" + ":".join(eq_parts) + f"[{nxt}]")
+        cur = nxt
+
+    if (red, green, blue) != (1.0, 1.0, 1.0):
+        nxt = "s3"
+        stages.append(f"[{cur}]colorchannelmixer=rr={red}:gg={green}:bb={blue}[{nxt}]")
+        cur = nxt
 
 
-def start_ffmpeg(path, vf, w, h):
+    needs_python_scale = bool(highlight) and pixelize
+    if needs_python_scale:
+        stages.append(f"[{cur}]null[vout]")
+        out_w, out_h = src_w, src_h
+    else:
+        scale_flags = FFMPEG_SCALE_FLAGS_PIXELIZE if pixelize else FFMPEG_SCALE_FLAGS
+        stages.append(f"[{cur}]scale={target_w}:{target_h}:{scale_flags}[vout]")
+        out_w, out_h = target_w, target_h
+
+    return ";".join(stages), out_w, out_h, needs_python_scale
+
+
+def _find_highlight_candidates(img: Image.Image, highlight_level: int):
+    radius = max(1, round(HIGHLIGHT_RADIUS_BASE + HIGHLIGHT_RADIUS_STEP * (highlight_level - 1)))
+
+    gray = img.convert("L")
+    local_mean = gray.filter(ImageFilter.BoxBlur(radius))
+    diff = ImageChops.difference(gray, local_mean)
+    mask = diff.point(lambda v: 255 if v > HIGHLIGHT_DIFF_MIN else 0)
+
+    w, h = mask.size
+    mask_px = mask.load()
+    diff_px = diff.load()
+
+    candidates = []
+    for y in range(h):
+        for x in range(w):
+            if mask_px[x, y]:
+                candidates.append((x, y, diff_px[x, y]))
+    return candidates
+
+
+def smart_downscale(img: Image.Image, target_w: int, target_h: int, highlight_level: int) -> Image.Image:
+    base = img.resize((target_w, target_h), Image.NEAREST)
+    if not highlight_level:
+        return base
+
+    candidates = _find_highlight_candidates(img, highlight_level)
+    if not candidates:
+        return base
+
+    w, h = img.size
+    sx, sy = w / target_w, h / target_h
+    base_px = base.load()
+    src_px = img.load()
+
+    best = {}
+    for x, y, strength in candidates:
+        out_x = (x + 0.5) / sx - 0.5
+        out_y = (y + 0.5) / sy - 0.5
+
+        fx = out_x - math.floor(out_x)
+        fy = out_y - math.floor(out_y)
+        if abs(fx - 0.5) < HIGHLIGHT_CROSSHAIR_EPS and abs(fy - 0.5) < HIGHLIGHT_CROSSHAIR_EPS:
+            out_x += 1.0 / sx
+            out_y += 1.0 / sy
+
+        ox = min(max(round(out_x), 0), target_w - 1)
+        oy = min(max(round(out_y), 0), target_h - 1)
+
+        prev = best.get((ox, oy))
+        if prev is None or strength > prev[0]:
+            best[(ox, oy)] = (strength, src_px[x, y])
+
+    for (ox, oy), (_, color) in best.items():
+        base_px[ox, oy] = color
+
+    return base
+
+def start_ffmpeg(path, filter_complex, w, h):
     cmd = [
         "ffmpeg", "-loglevel", "error", "-i", path,
-        "-vf", vf,
+        "-filter_complex", filter_complex, "-map", "[vout]",
         "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 3 * 4)
@@ -218,16 +333,42 @@ def main():
     p.add_argument("--font-aspect", type=float, default=2.0, help="height/width of the font symbol (for '--mode full')")
     p.add_argument("--no-audio", action="store_true", help="launch without sound")
     p.add_argument("--loop", action="store_true", help="play file cyclically until stopped manually")
-    p.add_argument("--highlight", type=int, choices=range(1, 9), metavar="1-8", default=0,
-                    help="enforcement of small contrast details (e.g stars in the sky)")
+    p.add_argument("-e", "--enhance", action="store_true",
+                    help="turn on a sensible default set of effects at once (highlight, brightness, contrast, "
+                         "saturation, gamma - see EFFECT_ENHANCE_DEFAULTS) instead of picking each one by hand; "
+                         "any effect flag you also pass explicitly overrides its enhance value")
+    p.add_argument("--highlight", type=int, choices=range(1, 9), metavar="1-8", default=None,
+                    help="grow small isolated bright/dark details (e.g. stars in the sky) before downscale, "
+                         "so pixelize point-sampling doesn't skip over them; only affects spots that stand out "
+                         "against a near-uniform local background, large/flat areas are left untouched; "
+                         "value = strength (dilation passes / mask blur radius) (default: 0, or "
+                         f"{EFFECT_ENHANCE_DEFAULTS['highlight']} with --enhance)")
     p.add_argument("--no-pixelize", dest="pixelize", action="store_false", default=True,
                     help="disable pixelize mode (use smooth lanczos downscale + full box-average instead of point-sampling); pixelize is ON by default")
+    p.add_argument("--gamma", type=float, default=None,
+                    help=f"gamma correction, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['gamma']} with --enhance)")
+    p.add_argument("--brightness", type=float, default=None,
+                    help=f"brightness offset, range -1..1, 0 = no change (default: 0.0, or {EFFECT_ENHANCE_DEFAULTS['brightness']} with --enhance)")
+    p.add_argument("--contrast", type=float, default=None,
+                    help=f"contrast, range -2..2, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['contrast']} with --enhance)")
+    p.add_argument("--saturation", type=float, default=None,
+                    help=f"saturation, range 0..3, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['saturation']} with --enhance)")
+    p.add_argument("--red", type=float, default=None, help="red channel multiplier (default: 1.0)")
+    p.add_argument("--green", type=float, default=None, help="green channel multiplier (default: 1.0)")
+    p.add_argument("--blue", type=float, default=None, help="blue channel multiplier (default: 1.0)")
     # p.add_argument("--pixel-blend", type=int, choices=range(PIXEL_BLEND_MIN, PIXEL_BLEND_MAX + 1),
     #                 metavar=f"{PIXEL_BLEND_MIN}-{PIXEL_BLEND_MAX}", default=DEFAULT_PIXEL_BLEND,
     #                 help=f"only in pixelize mode: how much to mix the point-sample with the arithmetic mean of the block; "
     #                      f"{PIXEL_BLEND_MAX} = pure point-sample (sharpest), {PIXEL_BLEND_MIN} = fully averaged (smoothest) "
     #                      f"(default: {DEFAULT_PIXEL_BLEND})")
     args = p.parse_args()
+
+    # Resolve effect flags: explicit CLI value > --enhance preset > normal default.
+    for _name, _normal in EFFECT_NORMAL_DEFAULTS.items():
+        _val = getattr(args, _name)
+        if _val is None:
+            _val = EFFECT_ENHANCE_DEFAULTS[_name] if args.enhance else _normal
+        setattr(args, _name, _val)
 
     args.pixel_blend = DEFAULT_PIXEL_BLEND
 
@@ -252,7 +393,12 @@ def main():
 
     audio_available = has_audio(args.path) and not args.no_audio
 
-    vf = build_vf(args.fps, target_w, target_h, args.highlight, args.pixelize)
+    filter_complex, ff_w, ff_h, needs_python_scale = build_filter_complex(
+            args.fps, src_w, src_h, target_w, target_h, args.highlight, args.pixelize,
+            args.gamma, args.brightness, args.contrast, args.saturation,
+            args.red, args.green, args.blue,
+        )
+    frame_bytes = ff_w * ff_h * 3
 
     # map 1..8 (smooth..sharp) to a 0.0..1.0 blend-toward-average fraction
     blend_frac = (PIXEL_BLEND_MAX - args.pixel_blend) / (PIXEL_BLEND_MAX - PIXEL_BLEND_MIN)
@@ -275,7 +421,7 @@ def main():
 
     try:
         while True:
-            ffmpeg_proc = start_ffmpeg(args.path, vf, target_w, target_h)
+            ffmpeg_proc = start_ffmpeg(args.path, filter_complex, ff_w, ff_h)
             if audio_available:
                 audio_proc = start_audio(args.path)
                 time.sleep(AUDIO_START_GRACE)
@@ -296,7 +442,9 @@ def main():
                     frame_idx += 1
                     continue
 
-                img = Image.frombytes("RGB", (target_w, target_h), raw)
+                img = Image.frombytes("RGB", (ff_w, ff_h), raw)
+                if needs_python_scale:
+                    img = smart_downscale(img, target_w, target_h, args.highlight)
                 body = render_full(img, row_mult, args.pixelize, blend_frac) if use_full else render_half(img)
                 sys.stdout.write(HOME + body)
                 sys.stdout.flush()
