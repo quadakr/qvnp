@@ -18,8 +18,8 @@ except ImportError:
     sys.exit(1)
 
 # ---- hardcoded control points ------------------------------------------
-DEFAULT_FPS = 15.0
-MAX_CATCHUP_DROP = 15
+DEFAULT_FPS = 25.0
+MAX_CATCHUP_DROP = 25
 AUDIO_START_GRACE = 0.01
 FFMPEG_SCALE_FLAGS = "flags=lanczos"
 FFMPEG_SCALE_FLAGS_PIXELIZE = "flags=neighbor"  # --pixelize: point-sampling
@@ -75,12 +75,12 @@ def check_binaries():
             sys.stderr.write(f"qvnp: not found {b} in PATH\n")
             sys.exit(1)
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
-
-
-def is_static_image(path: str) -> bool:
-    return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
-
+def is_static_image(path):
+    try:
+        with Image.open(path) as img:
+            return img.format in {"JPEG", "PNG", "BMP", "WEBP", "TIFF"}
+    except Exception:
+        return False
 
 def ffprobe_json(path: str, extra_args) -> dict:
     cmd = ["ffprobe", "-v", "error", "-of", "json"] + extra_args + [path]
@@ -104,7 +104,7 @@ def probe_video(path: str):
     s = streams[0]
     w, h = int(s["width"]), int(s["height"])
     num, den = s.get("r_frame_rate", "25/1").split("/")
-    src_fps = float(num) / float(den) if float(den) else 25.0
+    src_fps = float(num) / float(den) if float(den) else "undefined "
     return w, h, src_fps
 
 
@@ -311,6 +311,39 @@ def start_audio(path):
         start_new_session=False,
     )
 
+def probe_duration(path: str) -> float:
+    data = ffprobe_json(path, ["-show_entries", "format=duration"])
+    duration = data.get("format", {}).get("duration")
+    return float(duration) if duration else 0.0
+
+def format_properties(path: str, src_w: int, src_h: int, src_fps, has_audio: bool) -> str:
+    size = os.path.getsize(path)
+    duration = probe_duration(path)
+
+    if size >= 1024 ** 4:
+        size_str = f"{size / 1024 ** 4:.4f} TB"
+    elif size >= 1024 ** 3:
+        size_str = f"{size / 1024 ** 3:.2f} GB"
+    elif size >= 1024 ** 2:
+        size_str = f"{size / 1024 ** 2:.2f} MB"
+    elif size >= 1024:
+        size_str = f"{size / 1024:.1f} KB"
+    else:
+        size_str = f"{size} B"
+
+    if duration >= 3600:
+        dur_str = f"{int(duration // 3600)}:{int((duration % 3600) // 60):02d}:{int(duration % 60):02d}"
+    elif duration >= 60:
+        dur_str = f"{int(duration // 60)}:{int(duration % 60):02d}"
+    else:
+        dur_str = f"{duration:.1f}s"
+
+    audio_str = "audio" if has_audio else "no audio"
+
+    if src_fps is float:
+        return f"| {src_w}x{src_h} | {src_fps:.2f}fps | {dur_str} | {size_str} | {audio_str} |"
+    else:
+        return f"| {src_w}x{src_h} | static image | {size_str} | {audio_str} |"
 
 def read_exact(stream, n):
     buf = bytearray()
@@ -325,14 +358,14 @@ def read_exact(stream, n):
 def main():
     p = argparse.ArgumentParser(description="Video/photo playback in terminal.")
     p.add_argument("path", help="path to media-file")
-    p.add_argument("--width", type=int, help="width in symbols, terminal's width by default")
-    p.add_argument("--height", type=int, help="height in symbols, terminal's height minus one by default")
-    p.add_argument("--fps", type=float, default=DEFAULT_FPS, help=f"target fps (by default: {DEFAULT_FPS})")
-    p.add_argument("--mode", choices=["auto", "half", "full"], default="auto",
+    p.add_argument("-W", "--width", type=int, help="width in symbols, terminal's width by default")
+    p.add_argument("-H", "--height", type=int, help="height in symbols, terminal's height minus one by default")
+    p.add_argument("-f", "--fps", type=float, default=DEFAULT_FPS, help=f"target fps (by default: {DEFAULT_FPS})")
+    p.add_argument("-m", "--mode", choices=["auto", "half", "full"], default="auto",
                     help="half = more pixels, full = less pixels, full works better in tty, half in graphical terminal")
     p.add_argument("--font-aspect", type=float, default=2.0, help="height/width of the font symbol (for '--mode full')")
-    p.add_argument("--no-audio", action="store_true", help="launch without sound")
-    p.add_argument("--loop", action="store_true", help="play file cyclically until stopped manually")
+    p.add_argument("-na", "--no-audio", action="store_true", help="launch without sound")
+    p.add_argument("-l", "--loop", action="store_true", help="play file cyclically until stopped manually")
     p.add_argument("-e", "--enhance", action="store_true",
                     help="turn on a sensible default set of effects at once (highlight, brightness, contrast, "
                          "saturation, gamma - see EFFECT_ENHANCE_DEFAULTS) instead of picking each one by hand; "
@@ -343,25 +376,32 @@ def main():
                          "against a near-uniform local background, large/flat areas are left untouched; "
                          "value = strength (dilation passes / mask blur radius) (default: 0, or "
                          f"{EFFECT_ENHANCE_DEFAULTS['highlight']} with --enhance)")
-    p.add_argument("--no-pixelize", dest="pixelize", action="store_false", default=True,
+    p.add_argument("-np", "--no-pixelize", dest="pixelize", action="store_false", default=True,
                     help="disable pixelize mode (use smooth lanczos downscale + full box-average instead of point-sampling); pixelize is ON by default")
-    p.add_argument("--gamma", type=float, default=None,
+    p.add_argument("-g", "--gamma", type=float, default=None,
                     help=f"gamma correction, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['gamma']} with --enhance)")
-    p.add_argument("--brightness", type=float, default=None,
+    p.add_argument("-b", "--brightness", type=float, default=None,
                     help=f"brightness offset, range -1..1, 0 = no change (default: 0.0, or {EFFECT_ENHANCE_DEFAULTS['brightness']} with --enhance)")
-    p.add_argument("--contrast", type=float, default=None,
+    p.add_argument("-c", "--contrast", type=float, default=None,
                     help=f"contrast, range -2..2, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['contrast']} with --enhance)")
-    p.add_argument("--saturation", type=float, default=None,
+    p.add_argument("-s", "--saturation", type=float, default=None,
                     help=f"saturation, range 0..3, 1.0 = no change (default: 1.0, or {EFFECT_ENHANCE_DEFAULTS['saturation']} with --enhance)")
     p.add_argument("--red", type=float, default=None, help="red channel multiplier (default: 1.0)")
     p.add_argument("--green", type=float, default=None, help="green channel multiplier (default: 1.0)")
     p.add_argument("--blue", type=float, default=None, help="blue channel multiplier (default: 1.0)")
+    p.add_argument("-p", "--show-file-properties", action="store_true",
+                   help="show resolution, fps, duration, file size and audio status in the top line")
     # p.add_argument("--pixel-blend", type=int, choices=range(PIXEL_BLEND_MIN, PIXEL_BLEND_MAX + 1),
     #                 metavar=f"{PIXEL_BLEND_MIN}-{PIXEL_BLEND_MAX}", default=DEFAULT_PIXEL_BLEND,
     #                 help=f"only in pixelize mode: how much to mix the point-sample with the arithmetic mean of the block; "
     #                      f"{PIXEL_BLEND_MAX} = pure point-sample (sharpest), {PIXEL_BLEND_MIN} = fully averaged (smoothest) "
     #                      f"(default: {DEFAULT_PIXEL_BLEND})")
     args = p.parse_args()
+
+    # --enhance only makes sense for static images, silently disable for video
+    if args.enhance and not is_static_image(args.path):
+        args.enhance = False
+        print("No enhance for video yet.")
 
     # Resolve effect flags: explicit CLI value > --enhance preset > normal default.
     for _name, _normal in EFFECT_NORMAL_DEFAULTS.items():
@@ -386,6 +426,8 @@ def main():
     term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
     max_cols = args.width or term_cols
     max_rows = args.height or max(1, term_rows - 1)
+    if args.show_file_properties:
+        max_rows = max(1, max_rows - 1)
 
     src_w, src_h, _src_fps = probe_video(args.path)
     target_w, target_h = fit_size(src_w, src_h, max_cols, max_rows, col_mult, row_mult)
@@ -446,7 +488,14 @@ def main():
                 if needs_python_scale:
                     img = smart_downscale(img, target_w, target_h, args.highlight)
                 body = render_full(img, row_mult, args.pixelize, blend_frac) if use_full else render_half(img)
-                sys.stdout.write(HOME + body)
+                if args.show_file_properties:
+                    if is_static_image(args.path):
+                        props = format_properties(args.path, src_w, src_h, "no ", audio_available)
+                    else:
+                        props = format_properties(args.path, src_w, src_h, _src_fps, audio_available)
+                    sys.stdout.write(HOME + props + "\n" + body)
+                else:
+                    sys.stdout.write(HOME + body)
                 sys.stdout.flush()
 
                 frame_idx += 1
