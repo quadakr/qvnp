@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/quadakr/qvnp/main/install.sh | sudo
 ## Launch
 
 ```bash
-qvnp yourfile.mp4
+qp -e -p yourfile.mp4
 ```
 
 
